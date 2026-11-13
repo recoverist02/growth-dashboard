@@ -97,7 +97,7 @@
     <div class="boot-title">회복 &amp; 성장 통합 대시보드</div>
     <div class="boot-sub" id="bootStatus">Google Sheets 최신 데이터를 불러오는 중…</div>
     <div class="boot-actions" id="bootActions">
-      <a class="btn secondary" id="checkGasLink" href="https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec" target="_blank" rel="noopener">구글 연결 확인</a>
+      <a class="btn secondary" href="https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec" target="_blank" rel="noopener">구글 연결 확인</a>
       <button type="button" class="btn" onclick="location.reload()">다시 연결</button>
     </div>
   </div>
@@ -107,8 +107,8 @@
   <script>
     (() => {
       const GAS_URL = 'https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec';
-      const DATA_CACHE_KEY = 'recovery-dashboard-data-v2';
-      const UI_CACHE_KEY = 'recovery-dashboard-ui-v2';
+      const DATA_CACHE_KEY = 'recovery-dashboard-data-v3';
+      const UI_CACHE_KEY = 'recovery-dashboard-ui-v3';
       const CHANNEL = 'recovery-dashboard-v1';
 
       const appFrame = document.getElementById('appFrame');
@@ -120,104 +120,53 @@
       let currentData = null;
       let uiRendered = false;
 
-      // 1. JSONP 요청 (스크립트 로드 완료 시 콜백 미실행이면 즉시 브리지로 전환)
-      function fetchViaJsonp(forceFresh, includeUi) {
-        return new Promise((resolve, reject) => {
-          let settled = false;
-          const cbName = '__recoveryCb_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
-          const script = document.createElement('script');
-
-          const cleanup = () => {
-            clearTimeout(timer);
-            try { delete window[cbName]; } catch (_) {}
-            script.remove();
-          };
-
-          const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            reject(new Error('JSONP timeout'));
-          }, 12000);
-
-          window[cbName] = (payload) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            if (payload && (payload.data || payload.books)) {
-              resolve(payload.data ? payload : { data: payload });
-            } else {
-              reject(new Error('Invalid payload'));
-            }
-          };
-
-          script.onload = () => {
-            if (!settled) {
-              settled = true;
-              cleanup();
-              reject(new Error('JSONP did not execute callback'));
-            }
-          };
-
-          script.onerror = () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            reject(new Error('JSONP network error'));
-          };
-
-          const params = new URLSearchParams({
-            callback: cbName,
-            force: forceFresh ? '1' : '0',
-            includeUi: includeUi ? '1' : '0',
-            _: String(Date.now())
-          });
-          script.src = GAS_URL + '?' + params.toString();
-          document.head.appendChild(script);
-        });
-      }
-
-      // 2. 숨김 iframe 브리지 통신
       let bridgeSource = null;
+      let bridgeFrame = null;
       let bridgeReadyPromise = null;
       const bridgePending = new Map();
 
-      function ensureBridge() {
+      window.addEventListener('message', (event) => {
+        let host = '';
+        try { host = new URL(event.origin).hostname; } catch (_) { return; }
+        if (!host.endsWith('-script.googleusercontent.com') || !event.data || event.data.channel !== CHANNEL) return;
+        if (event.data.type === 'ready') {
+          if (!bridgeSource) {
+            bridgeSource = event.source;
+            if (window.__resolveBridgeReady) window.__resolveBridgeReady();
+          }
+          return;
+        }
+        if (event.source !== bridgeSource) return;
+        const item = bridgePending.get(event.data.id);
+        if (!item) return;
+        clearTimeout(item.timer);
+        bridgePending.delete(event.data.id);
+        event.data.error ? item.reject(new Error(event.data.error)) : item.resolve(event.data.result);
+      });
+
+      function connectBridge() {
         if (bridgeReadyPromise) return bridgeReadyPromise;
         bridgeReadyPromise = new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error('브리지 연결 시간 초과')), 15000);
-          window.addEventListener('message', (event) => {
-            let host = '';
-            try { host = new URL(event.origin).hostname; } catch { return; }
-            if (!host.endsWith('-script.googleusercontent.com') || !event.data || event.data.channel !== CHANNEL) return;
-            if (event.data.type === 'ready') {
-              if (!bridgeSource) {
-                bridgeSource = event.source;
-                clearTimeout(timer);
-                resolve();
-              }
-              return;
-            }
-            if (event.source !== bridgeSource) return;
-            const item = bridgePending.get(event.data.id);
-            if (!item) return;
-            clearTimeout(item.timer);
-            bridgePending.delete(event.data.id);
-            event.data.error ? item.reject(new Error(event.data.error)) : item.resolve(event.data.result);
-          });
-
-          const frame = document.createElement('iframe');
-          frame.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:0';
-          frame.setAttribute('aria-hidden', 'true');
-          frame.tabIndex = -1;
-          frame.src = GAS_URL + '?bridge=1';
-          document.body.appendChild(frame);
+          const timer = setTimeout(() => {
+            reject(new Error('브리지 연결 시간 초과'));
+          }, 12000);
+          window.__resolveBridgeReady = () => {
+            clearTimeout(timer);
+            resolve();
+          };
         });
+        bridgeFrame = document.createElement('iframe');
+        bridgeFrame.title = 'Google Sheets 연결';
+        bridgeFrame.setAttribute('aria-hidden', 'true');
+        bridgeFrame.tabIndex = -1;
+        bridgeFrame.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:0';
+        bridgeFrame.src = GAS_URL + '?bridge=1';
+        document.body.appendChild(bridgeFrame);
         return bridgeReadyPromise;
       }
 
-      async function fetchViaBridge(forceFresh, includeUi) {
-        await ensureBridge();
+      async function fetchDashboardPayload(forceFresh, includeUi) {
+        await connectBridge();
         return new Promise((resolve, reject) => {
           const id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
           const timer = setTimeout(() => {
@@ -234,32 +183,20 @@
         });
       }
 
-      // 3. 통합 호출 함수
-      async function fetchDashboardPayload(forceFresh, includeUi) {
-        ensureBridge().catch(() => {});
-        try {
-          return await fetchViaJsonp(forceFresh, includeUi);
-        } catch (_) {
-          return await fetchViaBridge(forceFresh, includeUi);
-        }
-      }
-
       window.__fetchDashboardFromGAS = async (forceFresh) => {
         const res = await fetchDashboardPayload(!!forceFresh, false);
         if (res && res.data) {
           currentData = res.data;
           try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(currentData)); } catch (_) {}
         }
-        return res.data;
+        return res ? res.data : null;
       };
 
-      // 4. UI HTML에 데이터 및 google.script.run 브리지 주입 (</script> 파서 충돌 방지)
       function buildPatchedHtml(rawHtml, bootstrapData) {
         const safeJson = JSON.stringify(bootstrapData || null).replace(/[<>&]/g, (ch) => {
           return '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0');
         });
-
-        const closeScriptTag = '<' + '/script>';
+        const closeTag = '<' + '/script>';
         const bridgeScript =
           '<script>\n' +
           '  window.__DASHBOARD_BOOTSTRAP__ = ' + safeJson + ';\n' +
@@ -282,14 +219,16 @@
           '      })()\n' +
           '    }\n' +
           '  };\n' +
-          closeScriptTag;
+          closeTag;
 
         const widgetRe = new RegExp('<script[^>]*sites-widget\\.js[^>]*>[\\s\\S]*?<' + '/script>', 'gi');
         const bootstrapRe = new RegExp('window\\.__DASHBOARD_BOOTSTRAP__\\s*=\\s*[\\s\\S]*?;\\s*<' + '/script>', 'i');
 
         let cleaned = String(rawHtml || '')
           .replace(widgetRe, '')
-          .replace(bootstrapRe, closeScriptTag);
+          .replace(bootstrapRe, closeTag)
+          .replace(/https:\/\/[a-z0-9.-]+\.chatgpt\.site/gi, 'https://recoverist02.github.io')
+          .replace(/window\.location\.replace\(\s*['"]about:blank['"]\s*\)/g, 'void 0');
 
         if (/<head[^>]*>/i.test(cleaned)) {
           return cleaned.replace(/<head[^>]*>/i, (match) => match + bridgeScript);
@@ -307,7 +246,16 @@
         uiRendered = true;
       }
 
-      // 5. 초기 실행
+      function fallbackDirectEmbed() {
+        if (uiRendered) return;
+        appFrame.onload = () => {
+          bootOverlay.classList.add('hidden');
+        };
+        appFrame.src = GAS_URL;
+        setTimeout(() => bootOverlay.classList.add('hidden'), 1500);
+        uiRendered = true;
+      }
+
       async function boot() {
         try {
           currentUiHtml = localStorage.getItem(UI_CACHE_KEY) || '';
@@ -348,11 +296,9 @@
             }).catch(() => {});
           }
         } catch (err) {
-          console.error(err);
-          if (!uiRendered) {
-            bootStatus.innerHTML = '시트 연결이 지연되고 있습니다.<br>앱스크립트 <b>[배포 관리] &rarr; [새 버전]</b> 배포 여부를 확인해 주세요.';
-            bootActions.style.display = 'flex';
-          }
+          console.warn('브리지 연결 실패, 직접 임베드로 전환합니다:', err);
+          fallbackDirectEmbed();
+          bootActions.style.display = 'flex';
         }
       }
 
