@@ -35,6 +35,7 @@
       align-items: center;
       justify-content: center;
       gap: 14px;
+      padding: 20px;
       background: #f8fafc;
       z-index: 10;
       transition: opacity 0.2s ease;
@@ -63,11 +64,17 @@
       font-size: 13px;
       color: #64748b;
       text-align: center;
-      line-height: 1.5;
+      line-height: 1.6;
     }
-    .retry-btn {
+    .boot-actions {
+      display: none;
+      gap: 8px;
       margin-top: 6px;
-      padding: 8px 16px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .btn {
+      padding: 9px 16px;
       border-radius: 10px;
       border: 0;
       background: #4f46e5;
@@ -75,7 +82,12 @@
       font-size: 13px;
       font-weight: 700;
       cursor: pointer;
-      display: none;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .btn.secondary {
+      background: #e2e8f0;
+      color: #334155;
     }
   </style>
 </head>
@@ -84,7 +96,10 @@
     <div class="logo-badge">🌱</div>
     <div class="boot-title">회복 &amp; 성장 통합 대시보드</div>
     <div class="boot-sub" id="bootStatus">Google Sheets 최신 데이터를 불러오는 중…</div>
-    <button type="button" class="retry-btn" id="retryBtn" onclick="location.reload()">다시 연결</button>
+    <div class="boot-actions" id="bootActions">
+      <a class="btn secondary" id="checkGasLink" href="https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec" target="_blank" rel="noopener">구글 연결 확인</a>
+      <button type="button" class="btn" onclick="location.reload()">다시 연결</button>
+    </div>
   </div>
 
   <iframe id="appFrame" title="회복 & 성장 통합 대시보드"></iframe>
@@ -99,32 +114,36 @@
       const appFrame = document.getElementById('appFrame');
       const bootOverlay = document.getElementById('bootOverlay');
       const bootStatus = document.getElementById('bootStatus');
-      const retryBtn = document.getElementById('retryBtn');
+      const bootActions = document.getElementById('bootActions');
 
       let currentUiHtml = '';
       let currentData = null;
       let uiRendered = false;
 
-      // 1. JSONP 요청 함수 (가장 빠른 기본 통신)
+      // 1. JSONP 요청 (스크립트 로드 완료 시 콜백 미실행이면 즉시 브리지로 전환)
       function fetchViaJsonp(forceFresh, includeUi) {
         return new Promise((resolve, reject) => {
           let settled = false;
           const cbName = '__recoveryCb_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
           const script = document.createElement('script');
+
+          const cleanup = () => {
+            clearTimeout(timer);
+            try { delete window[cbName]; } catch (_) {}
+            script.remove();
+          };
+
           const timer = setTimeout(() => {
             if (settled) return;
             settled = true;
-            delete window[cbName];
-            script.remove();
+            cleanup();
             reject(new Error('JSONP timeout'));
-          }, 18000);
+          }, 12000);
 
           window[cbName] = (payload) => {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
-            delete window[cbName];
-            script.remove();
+            cleanup();
             if (payload && (payload.data || payload.books)) {
               resolve(payload.data ? payload : { data: payload });
             } else {
@@ -132,12 +151,18 @@
             }
           };
 
+          script.onload = () => {
+            if (!settled) {
+              settled = true;
+              cleanup();
+              reject(new Error('JSONP did not execute callback'));
+            }
+          };
+
           script.onerror = () => {
             if (settled) return;
             settled = true;
-            clearTimeout(timer);
-            delete window[cbName];
-            script.remove();
+            cleanup();
             reject(new Error('JSONP network error'));
           };
 
@@ -152,7 +177,7 @@
         });
       }
 
-      // 2. 숨김 iframe 브리지 통신 (JSONP 차단 시 자동 백업)
+      // 2. 숨김 iframe 브리지 통신
       let bridgeSource = null;
       let bridgeReadyPromise = null;
       const bridgePending = new Map();
@@ -164,7 +189,7 @@
           window.addEventListener('message', (event) => {
             let host = '';
             try { host = new URL(event.origin).hostname; } catch { return; }
-            if (!host.endsWith('-script.googleusercontent.com') || event.data?.channel !== CHANNEL) return;
+            if (!host.endsWith('-script.googleusercontent.com') || !event.data || event.data.channel !== CHANNEL) return;
             if (event.data.type === 'ready') {
               if (!bridgeSource) {
                 bridgeSource = event.source;
@@ -202,65 +227,69 @@
           bridgePending.set(id, { resolve, reject, timer });
           bridgeSource.postMessage({
             channel: CHANNEL,
-            id,
+            id: id,
             method: 'getClientPayload',
             args: [!!forceFresh, !!includeUi]
           }, '*');
         });
       }
 
-      // 3. 통합 호출 함수 (JSONP 우선 -> 실패 시 브리지 자동 전환)
+      // 3. 통합 호출 함수
       async function fetchDashboardPayload(forceFresh, includeUi) {
+        ensureBridge().catch(() => {});
         try {
           return await fetchViaJsonp(forceFresh, includeUi);
-        } catch (err) {
+        } catch (_) {
           return await fetchViaBridge(forceFresh, includeUi);
         }
       }
 
-      // 자식 프레임(srcdoc) 내부의 google.script.run에서 호출하는 전역 브리지
       window.__fetchDashboardFromGAS = async (forceFresh) => {
         const res = await fetchDashboardPayload(!!forceFresh, false);
         if (res && res.data) {
           currentData = res.data;
-          try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(currentData)); } catch {}
+          try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(currentData)); } catch (_) {}
         }
         return res.data;
       };
 
-      // 4. UI HTML에 데이터 부트스트랩 및 google.script.run 연결 코드 주입
+      // 4. UI HTML에 데이터 및 google.script.run 브리지 주입 (</script> 파서 충돌 방지)
       function buildPatchedHtml(rawHtml, bootstrapData) {
         const safeJson = JSON.stringify(bootstrapData || null).replace(/[<>&]/g, (ch) => {
           return '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0');
         });
 
-        const bridgeScript = `
-<script>
-  window.__DASHBOARD_BOOTSTRAP__ = ${safeJson};
-  window.google = {
-    script: {
-      run: (function() {
-        function makeRunner(onSuccess, onFailure) {
-          return {
-            withSuccessHandler: function(fn) { return makeRunner(fn, onFailure); },
-            withFailureHandler: function(fn) { return makeRunner(onSuccess, fn); },
-            getDashboardData: function(forceFresh) {
-              if (!window.parent || !window.parent.__fetchDashboardFromGAS) return;
-              window.parent.__fetchDashboardFromGAS(!!forceFresh)
-                .then(function(data) { if (onSuccess) onSuccess(data); })
-                .catch(function(err) { if (onFailure) onFailure(err); });
-            }
-          };
-        }
-        return makeRunner(null, null);
-      })()
-    }
-  };
-<\/script>`;
+        const closeScriptTag = '<' + '/script>';
+        const bridgeScript =
+          '<script>\n' +
+          '  window.__DASHBOARD_BOOTSTRAP__ = ' + safeJson + ';\n' +
+          '  window.google = {\n' +
+          '    script: {\n' +
+          '      run: (function() {\n' +
+          '        function makeRunner(onSuccess, onFailure) {\n' +
+          '          return {\n' +
+          '            withSuccessHandler: function(fn) { return makeRunner(fn, onFailure); },\n' +
+          '            withFailureHandler: function(fn) { return makeRunner(onSuccess, fn); },\n' +
+          '            getDashboardData: function(forceFresh) {\n' +
+          '              if (!window.parent || !window.parent.__fetchDashboardFromGAS) return;\n' +
+          '              window.parent.__fetchDashboardFromGAS(!!forceFresh)\n' +
+          '                .then(function(data) { if (onSuccess) onSuccess(data); })\n' +
+          '                .catch(function(err) { if (onFailure) onFailure(err); });\n' +
+          '            }\n' +
+          '          };\n' +
+          '        }\n' +
+          '        return makeRunner(null, null);\n' +
+          '      })()\n' +
+          '    }\n' +
+          '  };\n' +
+          closeScriptTag;
+
+        const widgetRe = new RegExp('<script[^>]*sites-widget\\.js[^>]*>[\\s\\S]*?<' + '/script>', 'gi');
+        const bootstrapRe = new RegExp('window\\.__DASHBOARD_BOOTSTRAP__\\s*=\\s*[\\s\\S]*?;\\s*<' + '/script>', 'i');
 
         let cleaned = String(rawHtml || '')
-          .replace(/<script[^>]*sites-widget\.js[^>]*>[\s\S]*?<\/script>/gi, '')
-          .replace(/window\.__DASHBOARD_BOOTSTRAP__\s*=\s*[\s\S]*?;<\/script>/i, '</script>');
+          .replace(widgetRe, '')
+          .replace(bootstrapRe, closeScriptTag);
 
         if (/<head[^>]*>/i.test(cleaned)) {
           return cleaned.replace(/<head[^>]*>/i, (match) => match + bridgeScript);
@@ -274,18 +303,18 @@
           bootOverlay.classList.add('hidden');
         };
         appFrame.srcdoc = buildPatchedHtml(uiHtml, dataObj);
+        setTimeout(() => bootOverlay.classList.add('hidden'), 250);
         uiRendered = true;
       }
 
-      // 5. 초기 구동: 로컬 캐시 즉시 표시 후 최신 시트 데이터 동기화
+      // 5. 초기 실행
       async function boot() {
         try {
           currentUiHtml = localStorage.getItem(UI_CACHE_KEY) || '';
           const rawData = localStorage.getItem(DATA_CACHE_KEY);
           if (rawData) currentData = JSON.parse(rawData);
-        } catch {}
+        } catch (_) {}
 
-        // 캐시된 UI와 데이터가 있으면 0.05초 만에 즉시 렌더링
         if (currentUiHtml && currentData) {
           renderIntoFrame(currentUiHtml, currentData);
         }
@@ -293,28 +322,27 @@
         try {
           const needUi = !currentUiHtml;
           const res = await fetchDashboardPayload(false, needUi);
-          const freshData = res.data;
-          const freshUi = res.uiHtml || currentUiHtml;
+          const freshData = res ? res.data : null;
+          const freshUi = (res && res.uiHtml) ? res.uiHtml : currentUiHtml;
 
           if (freshData) {
             currentData = freshData;
-            try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(freshData)); } catch {}
+            try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(freshData)); } catch (_) {}
           }
-          if (res.uiHtml) {
+          if (res && res.uiHtml) {
             currentUiHtml = res.uiHtml;
-            try { localStorage.setItem(UI_CACHE_KEY, res.uiHtml); } catch {}
+            try { localStorage.setItem(UI_CACHE_KEY, res.uiHtml); } catch (_) {}
           }
 
           if (!uiRendered && freshUi) {
             renderIntoFrame(freshUi, currentData);
           }
 
-          // 백그라운드에서 최신 UI 스킨도 함께 갱신 확인
           if (!needUi) {
             fetchDashboardPayload(false, true).then((fullRes) => {
               if (fullRes && fullRes.uiHtml && fullRes.uiHtml !== currentUiHtml) {
                 currentUiHtml = fullRes.uiHtml;
-                try { localStorage.setItem(UI_CACHE_KEY, fullRes.uiHtml); } catch {}
+                try { localStorage.setItem(UI_CACHE_KEY, fullRes.uiHtml); } catch (_) {}
                 renderIntoFrame(currentUiHtml, fullRes.data || currentData);
               }
             }).catch(() => {});
@@ -322,8 +350,8 @@
         } catch (err) {
           console.error(err);
           if (!uiRendered) {
-            bootStatus.innerHTML = '시트 연결을 확인해 주세요.<br>(앱스크립트 새 버전 배포 및 액세스 권한: 모든 사용자 확인)';
-            retryBtn.style.display = 'inline-block';
+            bootStatus.innerHTML = '시트 연결이 지연되고 있습니다.<br>앱스크립트 <b>[배포 관리] &rarr; [새 버전]</b> 배포 여부를 확인해 주세요.';
+            bootActions.style.display = 'flex';
           }
         }
       }
