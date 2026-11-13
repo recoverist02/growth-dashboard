@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="robots" content="noindex,nofollow,noarchive" />
+  <title>회복 &amp; 성장 통합 대시보드</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Noto Sans KR", sans-serif;
+      color: #0f172a;
+      overflow: hidden;
+    }
+    #appFrame {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #f8fafc;
+      z-index: 1;
+    }
+    #bootOverlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      background: #f8fafc;
+      z-index: 10;
+      transition: opacity 0.2s ease;
+    }
+    #bootOverlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .logo-badge {
+      width: 52px;
+      height: 52px;
+      border-radius: 16px;
+      background: linear-gradient(135deg, #059669, #0284c7, #f59e0b);
+      display: grid;
+      place-items: center;
+      font-size: 26px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+    }
+    .boot-title {
+      font-size: 16px;
+      font-weight: 800;
+      color: #0f172a;
+      letter-spacing: -0.02em;
+    }
+    .boot-sub {
+      font-size: 13px;
+      color: #64748b;
+      text-align: center;
+      line-height: 1.5;
+    }
+    .retry-btn {
+      margin-top: 6px;
+      padding: 8px 16px;
+      border-radius: 10px;
+      border: 0;
+      background: #4f46e5;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="bootOverlay">
+    <div class="logo-badge">🌱</div>
+    <div class="boot-title">회복 &amp; 성장 통합 대시보드</div>
+    <div class="boot-sub" id="bootStatus">Google Sheets 최신 데이터를 불러오는 중…</div>
+    <button type="button" class="retry-btn" id="retryBtn" onclick="location.reload()">다시 연결</button>
+  </div>
+
+  <iframe id="appFrame" title="회복 & 성장 통합 대시보드"></iframe>
+
+  <script>
+    (() => {
+      const GAS_URL = 'https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec';
+      const DATA_CACHE_KEY = 'recovery-dashboard-data-v2';
+      const UI_CACHE_KEY = 'recovery-dashboard-ui-v2';
+      const CHANNEL = 'recovery-dashboard-v1';
+
+      const appFrame = document.getElementById('appFrame');
+      const bootOverlay = document.getElementById('bootOverlay');
+      const bootStatus = document.getElementById('bootStatus');
+      const retryBtn = document.getElementById('retryBtn');
+
+      let currentUiHtml = '';
+      let currentData = null;
+      let uiRendered = false;
+
+      // 1. JSONP 요청 함수 (가장 빠른 기본 통신)
+      function fetchViaJsonp(forceFresh, includeUi) {
+        return new Promise((resolve, reject) => {
+          let settled = false;
+          const cbName = '__recoveryCb_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
+          const script = document.createElement('script');
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            delete window[cbName];
+            script.remove();
+            reject(new Error('JSONP timeout'));
+          }, 18000);
+
+          window[cbName] = (payload) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            delete window[cbName];
+            script.remove();
+            if (payload && (payload.data || payload.books)) {
+              resolve(payload.data ? payload : { data: payload });
+            } else {
+              reject(new Error('Invalid payload'));
+            }
+          };
+
+          script.onerror = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            delete window[cbName];
+            script.remove();
+            reject(new Error('JSONP network error'));
+          };
+
+          const params = new URLSearchParams({
+            callback: cbName,
+            force: forceFresh ? '1' : '0',
+            includeUi: includeUi ? '1' : '0',
+            _: String(Date.now())
+          });
+          script.src = GAS_URL + '?' + params.toString();
+          document.head.appendChild(script);
+        });
+      }
+
+      // 2. 숨김 iframe 브리지 통신 (JSONP 차단 시 자동 백업)
+      let bridgeSource = null;
+      let bridgeReadyPromise = null;
+      const bridgePending = new Map();
+
+      function ensureBridge() {
+        if (bridgeReadyPromise) return bridgeReadyPromise;
+        bridgeReadyPromise = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('브리지 연결 시간 초과')), 15000);
+          window.addEventListener('message', (event) => {
+            let host = '';
+            try { host = new URL(event.origin).hostname; } catch { return; }
+            if (!host.endsWith('-script.googleusercontent.com') || event.data?.channel !== CHANNEL) return;
+            if (event.data.type === 'ready') {
+              if (!bridgeSource) {
+                bridgeSource = event.source;
+                clearTimeout(timer);
+                resolve();
+              }
+              return;
+            }
+            if (event.source !== bridgeSource) return;
+            const item = bridgePending.get(event.data.id);
+            if (!item) return;
+            clearTimeout(item.timer);
+            bridgePending.delete(event.data.id);
+            event.data.error ? item.reject(new Error(event.data.error)) : item.resolve(event.data.result);
+          });
+
+          const frame = document.createElement('iframe');
+          frame.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:0';
+          frame.setAttribute('aria-hidden', 'true');
+          frame.tabIndex = -1;
+          frame.src = GAS_URL + '?bridge=1';
+          document.body.appendChild(frame);
+        });
+        return bridgeReadyPromise;
+      }
+
+      async function fetchViaBridge(forceFresh, includeUi) {
+        await ensureBridge();
+        return new Promise((resolve, reject) => {
+          const id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
+          const timer = setTimeout(() => {
+            bridgePending.delete(id);
+            reject(new Error('시트 응답 시간 초과'));
+          }, 25000);
+          bridgePending.set(id, { resolve, reject, timer });
+          bridgeSource.postMessage({
+            channel: CHANNEL,
+            id,
+            method: 'getClientPayload',
+            args: [!!forceFresh, !!includeUi]
+          }, '*');
+        });
+      }
+
+      // 3. 통합 호출 함수 (JSONP 우선 -> 실패 시 브리지 자동 전환)
+      async function fetchDashboardPayload(forceFresh, includeUi) {
+        try {
+          return await fetchViaJsonp(forceFresh, includeUi);
+        } catch (err) {
+          return await fetchViaBridge(forceFresh, includeUi);
+        }
+      }
+
+      // 자식 프레임(srcdoc) 내부의 google.script.run에서 호출하는 전역 브리지
+      window.__fetchDashboardFromGAS = async (forceFresh) => {
+        const res = await fetchDashboardPayload(!!forceFresh, false);
+        if (res && res.data) {
+          currentData = res.data;
+          try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(currentData)); } catch {}
+        }
+        return res.data;
+      };
+
+      // 4. UI HTML에 데이터 부트스트랩 및 google.script.run 연결 코드 주입
+      function buildPatchedHtml(rawHtml, bootstrapData) {
+        const safeJson = JSON.stringify(bootstrapData || null).replace(/[<>&]/g, (ch) => {
+          return '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0');
+        });
+
+        const bridgeScript = `
+<script>
+  window.__DASHBOARD_BOOTSTRAP__ = ${safeJson};
+  window.google = {
+    script: {
+      run: (function() {
+        function makeRunner(onSuccess, onFailure) {
+          return {
+            withSuccessHandler: function(fn) { return makeRunner(fn, onFailure); },
+            withFailureHandler: function(fn) { return makeRunner(onSuccess, fn); },
+            getDashboardData: function(forceFresh) {
+              if (!window.parent || !window.parent.__fetchDashboardFromGAS) return;
+              window.parent.__fetchDashboardFromGAS(!!forceFresh)
+                .then(function(data) { if (onSuccess) onSuccess(data); })
+                .catch(function(err) { if (onFailure) onFailure(err); });
+            }
+          };
+        }
+        return makeRunner(null, null);
+      })()
+    }
+  };
+<\/script>`;
+
+        let cleaned = String(rawHtml || '')
+          .replace(/<script[^>]*sites-widget\.js[^>]*>[\s\S]*?<\/script>/gi, '')
+          .replace(/window\.__DASHBOARD_BOOTSTRAP__\s*=\s*[\s\S]*?;<\/script>/i, '</script>');
+
+        if (/<head[^>]*>/i.test(cleaned)) {
+          return cleaned.replace(/<head[^>]*>/i, (match) => match + bridgeScript);
+        }
+        return bridgeScript + cleaned;
+      }
+
+      function renderIntoFrame(uiHtml, dataObj) {
+        if (!uiHtml) return;
+        appFrame.onload = () => {
+          bootOverlay.classList.add('hidden');
+        };
+        appFrame.srcdoc = buildPatchedHtml(uiHtml, dataObj);
+        uiRendered = true;
+      }
+
+      // 5. 초기 구동: 로컬 캐시 즉시 표시 후 최신 시트 데이터 동기화
+      async function boot() {
+        try {
+          currentUiHtml = localStorage.getItem(UI_CACHE_KEY) || '';
+          const rawData = localStorage.getItem(DATA_CACHE_KEY);
+          if (rawData) currentData = JSON.parse(rawData);
+        } catch {}
+
+        // 캐시된 UI와 데이터가 있으면 0.05초 만에 즉시 렌더링
+        if (currentUiHtml && currentData) {
+          renderIntoFrame(currentUiHtml, currentData);
+        }
+
+        try {
+          const needUi = !currentUiHtml;
+          const res = await fetchDashboardPayload(false, needUi);
+          const freshData = res.data;
+          const freshUi = res.uiHtml || currentUiHtml;
+
+          if (freshData) {
+            currentData = freshData;
+            try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(freshData)); } catch {}
+          }
+          if (res.uiHtml) {
+            currentUiHtml = res.uiHtml;
+            try { localStorage.setItem(UI_CACHE_KEY, res.uiHtml); } catch {}
+          }
+
+          if (!uiRendered && freshUi) {
+            renderIntoFrame(freshUi, currentData);
+          }
+
+          // 백그라운드에서 최신 UI 스킨도 함께 갱신 확인
+          if (!needUi) {
+            fetchDashboardPayload(false, true).then((fullRes) => {
+              if (fullRes && fullRes.uiHtml && fullRes.uiHtml !== currentUiHtml) {
+                currentUiHtml = fullRes.uiHtml;
+                try { localStorage.setItem(UI_CACHE_KEY, fullRes.uiHtml); } catch {}
+                renderIntoFrame(currentUiHtml, fullRes.data || currentData);
+              }
+            }).catch(() => {});
+          }
+        } catch (err) {
+          console.error(err);
+          if (!uiRendered) {
+            bootStatus.innerHTML = '시트 연결을 확인해 주세요.<br>(앱스크립트 새 버전 배포 및 액세스 권한: 모든 사용자 확인)';
+            retryBtn.style.display = 'inline-block';
+          }
+        }
+      }
+
+      boot();
+    })();
+  </script>
+</body>
+</html>
