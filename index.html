@@ -95,7 +95,7 @@
   <div id="bootOverlay">
     <div class="logo-badge">🌱</div>
     <div class="boot-title">회복 &amp; 성장 통합 대시보드</div>
-    <div class="boot-sub" id="bootStatus">Google Sheets 최신 데이터를 불러오는 중…</div>
+    <div class="boot-sub" id="bootStatus">클라우드에서 초고속으로 불러오는 중…</div>
     <div class="boot-actions" id="bootActions">
       <a class="btn secondary" href="https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec" target="_blank" rel="noopener">구글 연결 확인</a>
       <button type="button" class="btn" onclick="location.reload()">다시 연결</button>
@@ -106,6 +106,10 @@
 
   <script>
     (() => {
+      const FIREBASE_DB_URL = 'https://recoverist-hub-default-rtdb.asia-southeast1.firebasedatabase.app/';
+      const cleanFbUrl = String(FIREBASE_DB_URL || '').trim().replace(/\/+$/, '');
+      const hasFirebase = cleanFbUrl.startsWith('https://');
+
       const GAS_URL = 'https://script.google.com/macros/s/AKfycbzihf4YmTK0KTi3XuHF9JQ8v9C7ofLXmwhXVFxGrd5gIaKcCvIIlnISdTf5v3hGQMoj/exec';
       const DATA_CACHE_KEY = 'recovery-dashboard-data-v3';
       const UI_CACHE_KEY = 'recovery-dashboard-ui-v3';
@@ -124,6 +128,28 @@
       let bridgeFrame = null;
       let bridgeReadyPromise = null;
       const bridgePending = new Map();
+
+      async function readCloud(key) {
+        if (!hasFirebase) return null;
+        try {
+          const res = await fetch(`${cleanFbUrl}/growth/${key}.json`, { cache: 'no-store' });
+          if (!res.ok) return null;
+          return await res.json();
+        } catch (_) {
+          return null;
+        }
+      }
+
+      async function writeCloud(key, data) {
+        if (!hasFirebase || data === undefined || data === null) return;
+        try {
+          await fetch(`${cleanFbUrl}/growth/${key}.json`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+        } catch (_) {}
+      }
 
       window.addEventListener('message', (event) => {
         let host = '';
@@ -149,7 +175,7 @@
         bridgeReadyPromise = new Promise((resolve, reject) => {
           const timer = setTimeout(() => {
             reject(new Error('브리지 연결 시간 초과'));
-          }, 12000);
+          }, 15000);
           window.__resolveBridgeReady = () => {
             clearTimeout(timer);
             resolve();
@@ -183,13 +209,32 @@
         });
       }
 
+      // 내부 대시보드에서 새로고침/조회 호출 시: 클라우드 우선 응답 또는 강제 시트 동기화
       window.__fetchDashboardFromGAS = async (forceFresh) => {
+        if (!forceFresh) {
+          const cloudData = await readCloud('data');
+          if (cloudData) {
+            currentData = cloudData;
+            try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(currentData)); } catch (_) {}
+            // 백그라운드에서 구글 시트 최신본 확인 및 클라우드 갱신
+            fetchDashboardPayload(false, false).then((res) => {
+              if (res && res.data) {
+                currentData = res.data;
+                writeCloud('data', res.data);
+                try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(res.data)); } catch (_) {}
+              }
+            }).catch(() => {});
+            return cloudData;
+          }
+        }
+
         const res = await fetchDashboardPayload(!!forceFresh, false);
         if (res && res.data) {
           currentData = res.data;
+          writeCloud('data', res.data);
           try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(currentData)); } catch (_) {}
         }
-        return res ? res.data : null;
+        return res ? res.data : currentData;
       };
 
       function buildPatchedHtml(rawHtml, bootstrapData) {
@@ -242,7 +287,7 @@
           bootOverlay.classList.add('hidden');
         };
         appFrame.srcdoc = buildPatchedHtml(uiHtml, dataObj);
-        setTimeout(() => bootOverlay.classList.add('hidden'), 250);
+        setTimeout(() => bootOverlay.classList.add('hidden'), 200);
         uiRendered = true;
       }
 
@@ -257,6 +302,7 @@
       }
 
       async function boot() {
+        // 1단계: 로컬 캐시 확인
         try {
           currentUiHtml = localStorage.getItem(UI_CACHE_KEY) || '';
           const rawData = localStorage.getItem(DATA_CACHE_KEY);
@@ -267,6 +313,28 @@
           renderIntoFrame(currentUiHtml, currentData);
         }
 
+        // 2단계: Firebase 클라우드에서 0.1초 만에 최신 데이터 & UI 로드
+        try {
+          const [cloudData, cloudUi] = await Promise.all([
+            readCloud('data'),
+            currentUiHtml ? Promise.resolve(null) : readCloud('uiHtml')
+          ]);
+
+          if (cloudData) {
+            currentData = cloudData;
+            try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(cloudData)); } catch (_) {}
+          }
+          if (cloudUi && typeof cloudUi === 'string') {
+            currentUiHtml = cloudUi;
+            try { localStorage.setItem(UI_CACHE_KEY, cloudUi); } catch (_) {}
+          }
+
+          if (currentUiHtml && currentData) {
+            renderIntoFrame(currentUiHtml, currentData);
+          }
+        } catch (_) {}
+
+        // 3단계: 백그라운드에서 구글 시트 원본과 동기화 후 클라우드 최신화
         try {
           const needUi = !currentUiHtml;
           const res = await fetchDashboardPayload(false, needUi);
@@ -274,11 +342,17 @@
           const freshUi = (res && res.uiHtml) ? res.uiHtml : currentUiHtml;
 
           if (freshData) {
+            const changed = JSON.stringify(freshData) !== JSON.stringify(currentData);
             currentData = freshData;
+            writeCloud('data', freshData);
             try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(freshData)); } catch (_) {}
+            if ((!uiRendered || changed) && freshUi) {
+              renderIntoFrame(freshUi, currentData);
+            }
           }
           if (res && res.uiHtml) {
             currentUiHtml = res.uiHtml;
+            writeCloud('uiHtml', res.uiHtml);
             try { localStorage.setItem(UI_CACHE_KEY, res.uiHtml); } catch (_) {}
           }
 
@@ -288,17 +362,22 @@
 
           if (!needUi) {
             fetchDashboardPayload(false, true).then((fullRes) => {
-              if (fullRes && fullRes.uiHtml && fullRes.uiHtml !== currentUiHtml) {
-                currentUiHtml = fullRes.uiHtml;
-                try { localStorage.setItem(UI_CACHE_KEY, fullRes.uiHtml); } catch (_) {}
-                renderIntoFrame(currentUiHtml, fullRes.data || currentData);
+              if (fullRes && fullRes.uiHtml) {
+                writeCloud('uiHtml', fullRes.uiHtml);
+                if (fullRes.uiHtml !== currentUiHtml) {
+                  currentUiHtml = fullRes.uiHtml;
+                  try { localStorage.setItem(UI_CACHE_KEY, fullRes.uiHtml); } catch (_) {}
+                  renderIntoFrame(currentUiHtml, fullRes.data || currentData);
+                }
               }
             }).catch(() => {});
           }
         } catch (err) {
-          console.warn('브리지 연결 실패, 직접 임베드로 전환합니다:', err);
-          fallbackDirectEmbed();
-          bootActions.style.display = 'flex';
+          console.warn('시트 백그라운드 동기화 지연:', err);
+          if (!uiRendered) {
+            fallbackDirectEmbed();
+            bootActions.style.display = 'flex';
+          }
         }
       }
 
