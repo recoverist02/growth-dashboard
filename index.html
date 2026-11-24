@@ -138,22 +138,13 @@
       }
 
       // 1. 페이지 시작 즉시 클라우드 UI와 통합 데이터를 병렬 프리패치
-      const prefetchDataPromise = fetch(`${cleanFbUrl}/growth/data.json`, { cache: 'no-store' })
-        .then(r => (r.ok ? r.json() : null))
-        .then(d => normalizeGrowthData(d))
-        .catch(() => null);
-
-      const prefetchUiPromise = fetch(`${cleanFbUrl}/growth/ui.json`, { cache: 'no-store' })
-        .then(r => (r.ok ? r.json() : null))
-        .then(d => (d && typeof d.html === 'string' ? d.html : (typeof d === 'string' ? d : '')))
-        .catch(() => '');
-
       let currentUiHtml = '';
       let currentData = null;
       let uiRendered = false;
 
       // 2. 구글 앱스크립트 백그라운드 브리지 연결 (수동 새로고침 및 최초 1회 초기화용)
       let bridgeSource = null;
+      let bridgeOrigin;
       let bridgeReadyPromise = null;
       const bridgePending = new Map();
 
@@ -164,6 +155,7 @@
         if (event.data.type === 'ready') {
           if (!bridgeSource) {
             bridgeSource = event.source;
+            bridgeOrigin = event.origin;
             if (window.__resolveBridgeReady) window.__resolveBridgeReady();
           }
           return;
@@ -195,7 +187,8 @@
         return bridgeReadyPromise;
       }
 
-      async function fetchFromSheetBridge(forceFresh, includeUi) {
+      function fetchFromSheetBridge(forceFresh, includeUi) {return request('getClientPayload',[!!forceFresh,!!includeUi]);}
+      async function request(method,args) {
         await connectBridge();
         return new Promise((resolve, reject) => {
           const id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
@@ -207,22 +200,13 @@
           bridgeSource.postMessage({
             channel: CHANNEL,
             id,
-            method: 'getClientPayload',
-            args: [!!forceFresh, !!includeUi]
-          }, '*');
+            method, sessionToken,
+            args
+          }, bridgeOrigin);
         });
       }
 
-      async function saveToCloud(path, payload) {
-        try {
-          await fetch(`${cleanFbUrl}/growth/${path}.json`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-        } catch (_) {}
-      }
-
+      
       // 내부 UI에서 getDashboardData(forceFresh) 호출 시 처리
       window.__fetchDashboardFromGAS = async (forceFresh) => {
         if (!forceFresh && currentData) {
@@ -235,19 +219,10 @@
           if (fresh) {
             currentData = fresh;
             try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(fresh)); } catch (_) {}
-            saveToCloud('data', fresh);
             return fresh;
           }
         } catch (_) {
-          // 브리지 지연 시 클라우드 최신본 재조회
-          const cloud = await fetch(`${cleanFbUrl}/growth/data.json`, { cache: 'no-store' })
-            .then(r => (r.ok ? r.json() : null))
-            .then(d => normalizeGrowthData(d))
-            .catch(() => null);
-          if (cloud) {
-            currentData = cloud;
-            return cloud;
-          }
+          // 서버 지연 시 마지막 인증된 조회 결과를 사용한다.
         }
         return currentData;
       };
@@ -305,17 +280,6 @@
       }
 
       async function boot() {
-        // 1순위: Firebase 클라우드에서 0.1초 만에 로드
-        const [cloudData, cloudUi] = await Promise.all([prefetchDataPromise, prefetchUiPromise]);
-        if (cloudData) {
-          currentData = cloudData;
-          try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(cloudData)); } catch (_) {}
-        }
-        if (cloudUi) {
-          currentUiHtml = cloudUi;
-          try { localStorage.setItem(UI_CACHE_KEY, cloudUi); } catch (_) {}
-        }
-
         // 로컬 캐시 폴백
         if (!currentData || !currentUiHtml) {
           try {
@@ -327,25 +291,20 @@
           } catch (_) {}
         }
 
-        if (currentUiHtml && currentData) {
-          renderIntoFrame(currentUiHtml, currentData);
-          return;
-        }
+        
 
         // 클라우드가 비어있는 최초 1회에만 시트 브리지에서 가져와 클라우드 자동 세팅
-        bootStatus.textContent = '최초 1회: 통합 시트 데이터를 클라우드에 세팅 중…';
+        bootStatus.textContent = '대시보드 기록을 불러오는 중…';
         try {
           const res = await fetchFromSheetBridge(false, !currentUiHtml);
           const freshData = normalizeGrowthData(res ? res.data : null);
           const freshUi = (res && res.uiHtml) ? res.uiHtml : currentUiHtml;
           if (freshData) {
             currentData = freshData;
-            saveToCloud('data', freshData);
             try { localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(freshData)); } catch (_) {}
           }
           if (freshUi) {
             currentUiHtml = freshUi;
-            saveToCloud('ui', { html: freshUi, updatedAt: Date.now() });
             try { localStorage.setItem(UI_CACHE_KEY, freshUi); } catch (_) {}
           }
           renderIntoFrame(currentUiHtml, currentData);
@@ -354,7 +313,50 @@
         }
       }
 
-      boot();
+      const authenticate = req => request(req.action,[req.pin || '',req.keep === true]);
+      let sessionToken = '';
+      const storageKey = 'private-app-session-v1';
+      async function openPrivateApp() {
+        const panel = document.createElement('dialog');
+        panel.style.cssText = 'padding:24px;border:0;border-radius:16px;max-width:90vw;color:#122c30';
+        panel.innerHTML = '<form><strong>개인용 앱 로그인</strong><p><label>4자리 PIN <input type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required size="5"></label></p><label><input type="checkbox" checked> 7일 유지</label> <button>로그인</button><p role="status"></p><a target="_blank" rel="noopener">Google 계정 확인</a></form>';
+        panel.querySelector('a').href = GAS_URL;
+        document.body.appendChild(panel);
+        panel.addEventListener('cancel', event => event.preventDefault());
+        panel.showModal();
+        const form = panel.querySelector('form');
+        const [pin, keep] = form.querySelectorAll('input');
+        async function unlock(action) {
+          const session = await authenticate(action);
+          if (!session || typeof session.token !== 'string' || !(session.expiresAt > Date.now())) throw Error('LOGIN_REQUIRED');
+          sessionToken = session.token;
+          const remaining = session.expiresAt - Date.now();
+          setTimeout(() => location.reload(), remaining);
+          panel.remove();
+          await boot();
+        }
+        sessionToken = localStorage.getItem(storageKey) || sessionStorage.getItem(storageKey) || '';
+        form.onsubmit = async event => {
+          event.preventDefault();
+          form.querySelector('button').disabled = true;
+          try {
+            await unlock({action:'pin-login', pin:pin.value, keep:keep.checked});
+            localStorage.removeItem(storageKey);
+            sessionStorage.removeItem(storageKey);
+            (keep.checked ? localStorage : sessionStorage).setItem(storageKey,sessionToken);
+          } catch (error) {
+            pin.value = '';
+            form.querySelector('[role=status]').textContent = /TRY_LATER/.test(error.message) ? '15분 뒤에 다시 시도해줘.' : /INVALID_PIN/.test(error.message) ? 'PIN을 다시 확인해줘.' : 'Google 계정 확인 후 새로고침해줘.';
+          } finally { form.querySelector('button').disabled = false; }
+        };
+        if (sessionToken) {
+          form.querySelector('button').disabled = true;
+          try { await unlock({action:'pin-resume', sessionToken}); }
+          catch { sessionToken = ''; localStorage.removeItem(storageKey); sessionStorage.removeItem(storageKey); }
+          finally { form.querySelector('button').disabled = false; }
+        }
+      }
+      openPrivateApp();
     })();
   </script>
 </body>
